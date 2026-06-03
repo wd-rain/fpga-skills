@@ -13,7 +13,8 @@ param(
 
     [string]$VitisRoot = "A:\App\xilinx\Vitis\2020.2",
     [string]$VivadoProject = "",
-    [string]$ProcessorFilter = "*A9*#0",
+    [string]$LaunchConfigName = "",
+    [string]$ProcessorFilter = "",
     [switch]$OverwriteReadme
 )
 
@@ -69,6 +70,289 @@ function Get-RelativeForwardPath {
     return [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString())
 }
 
+function Convert-ToComparableText {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return (Convert-ToForwardSlash $Value).ToLowerInvariant()
+}
+
+function Find-LaunchValue {
+    param(
+        [System.Collections.IDictionary]$Attributes,
+        [string[]]$KeyPatterns
+    )
+
+    foreach ($key in $Attributes.Keys) {
+        foreach ($pattern in $KeyPatterns) {
+            if ([string]$key -match $pattern) {
+                $value = $Attributes[$key]
+                if ($value -is [System.Array]) {
+                    return (($value | Where-Object { $_ }) -join "; ")
+                }
+
+                return [string]$value
+            }
+        }
+    }
+
+    return ""
+}
+
+function Join-LaunchText {
+    param(
+        [System.Collections.IDictionary]$Attributes,
+        [string[]]$ExtraValues
+    )
+
+    $values = New-Object System.Collections.Generic.List[string]
+    foreach ($value in $ExtraValues) {
+        if ($value) {
+            $values.Add([string]$value)
+        }
+    }
+
+    foreach ($key in $Attributes.Keys) {
+        $values.Add([string]$key)
+        $rawValue = $Attributes[$key]
+        if ($rawValue -is [System.Array]) {
+            foreach ($entry in $rawValue) {
+                if ($entry) {
+                    $values.Add([string]$entry)
+                }
+            }
+        } elseif ($rawValue) {
+            $values.Add([string]$rawValue)
+        }
+    }
+
+    return ($values -join "`n")
+}
+
+function Get-ProcessorFilterFromText {
+    param([string]$Text)
+
+    $processorPatterns = @(
+        @{ Regex = '(?i)ps7_cortexa9_(\d+)'; Target = 'A9' },
+        @{ Regex = '(?i)psu_cortexa53_(\d+)'; Target = 'A53' },
+        @{ Regex = '(?i)psu_cortexr5_(\d+)'; Target = 'R5' },
+        @{ Regex = '(?i)microblaze_(\d+)'; Target = 'MicroBlaze' },
+        @{ Regex = '(?i)cortex[-_ ]?a9\s*#\s*(\d+)'; Target = 'A9' },
+        @{ Regex = '(?i)cortex[-_ ]?a53\s*#\s*(\d+)'; Target = 'A53' },
+        @{ Regex = '(?i)cortex[-_ ]?r5\s*#\s*(\d+)'; Target = 'R5' },
+        @{ Regex = '(?i)microblaze\s*#\s*(\d+)'; Target = 'MicroBlaze' }
+    )
+
+    foreach ($pattern in $processorPatterns) {
+        if ($Text -match $pattern.Regex) {
+            return "*$($pattern.Target)*#$($Matches[1])"
+        }
+    }
+
+    if ($Text -match '(?i)ps7_cortexa9|cortex[-_ ]?a9') {
+        return "*A9*#0"
+    }
+
+    if ($Text -match '(?i)psu_cortexa53|cortex[-_ ]?a53') {
+        return "*A53*#0"
+    }
+
+    if ($Text -match '(?i)psu_cortexr5|cortex[-_ ]?r5') {
+        return "*R5*#0"
+    }
+
+    if ($Text -match '(?i)microblaze') {
+        return "*MicroBlaze*#0"
+    }
+
+    return ""
+}
+
+function Get-LaunchKind {
+    param(
+        [string]$Name,
+        [string]$Type
+    )
+
+    if ($Name -match '(?i)\b(debug|gdb)\b') {
+        return "debug"
+    }
+
+    if ($Name -match '(?i)\b(run|download)\b') {
+        return "run"
+    }
+
+    if ($Type -match '(?i)debug|gdb') {
+        return "run/debug"
+    }
+
+    if ($Type -match '(?i)run') {
+        return "run"
+    }
+
+    return "unknown"
+}
+
+function Read-VitisLaunchConfig {
+    param([System.IO.FileInfo]$File)
+
+    try {
+        [xml]$xml = Get-Content -Raw -Encoding UTF8 -LiteralPath $File.FullName
+    } catch {
+        return $null
+    }
+
+    if (-not $xml.launchConfiguration) {
+        return $null
+    }
+
+    $attributes = [ordered]@{}
+    foreach ($node in $xml.launchConfiguration.ChildNodes) {
+        if ($node.NodeType -ne [System.Xml.XmlNodeType]::Element) {
+            continue
+        }
+
+        if (-not $node.HasAttribute("key")) {
+            continue
+        }
+
+        $key = $node.GetAttribute("key")
+        if ($node.Name -eq "listAttribute") {
+            $values = @()
+            foreach ($entry in $node.ChildNodes) {
+                if (($entry.NodeType -eq [System.Xml.XmlNodeType]::Element) -and $entry.HasAttribute("value")) {
+                    $values += $entry.GetAttribute("value")
+                }
+            }
+            $attributes[$key] = $values
+        } elseif ($node.HasAttribute("value")) {
+            $attributes[$key] = $node.GetAttribute("value")
+        }
+    }
+
+    $type = $xml.launchConfiguration.type
+    $text = Join-LaunchText -Attributes $attributes -ExtraValues @($File.BaseName, $File.FullName, $type)
+
+    return [pscustomobject]@{
+        Name = $File.BaseName
+        Path = $File.FullName
+        Type = $type
+        Kind = Get-LaunchKind -Name $File.BaseName -Type $type
+        ProcessorHint = Find-LaunchValue -Attributes $attributes -KeyPatterns @("processor", "cpu", "core", "target.*name")
+        ProgramHint = Find-LaunchValue -Attributes $attributes -KeyPatterns @("program", "elf", "application")
+        ProcessorFilter = Get-ProcessorFilterFromText -Text $text
+        Text = $text
+    }
+}
+
+function Test-LaunchMatchesProject {
+    param(
+        [pscustomobject]$Launch,
+        [string]$AppName,
+        [string]$PlatformName,
+        [string]$AppRoot,
+        [string]$PlatformRoot
+    )
+
+    $text = Convert-ToComparableText $Launch.Text
+    $isVitisLaunch = ($text.Contains("xilinx") -or $text.Contains("vitis") -or
+        $text.Contains(".elf") -or $text.Contains("cortex") -or $text.Contains("microblaze"))
+
+    if (-not $isVitisLaunch) {
+        return $false
+    }
+
+    $needles = @(
+        (Convert-ToComparableText $AppName),
+        (Convert-ToComparableText $PlatformName),
+        (Convert-ToComparableText $AppRoot),
+        (Convert-ToComparableText $PlatformRoot)
+    ) | Where-Object { $_ }
+
+    foreach ($needle in $needles) {
+        if ($text.Contains($needle)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-VitisLaunchConfigs {
+    param(
+        [string]$Workspace,
+        [string]$VitisWs,
+        [string]$AppName,
+        [string]$PlatformName,
+        [string]$AppRoot,
+        [string]$PlatformRoot
+    )
+
+    $roots = @($VitisWs, $Workspace, $AppRoot, $PlatformRoot) |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+        Select-Object -Unique
+
+    $seen = @{}
+    $configs = @()
+    foreach ($root in $roots) {
+        Get-ChildItem -LiteralPath $root -Force -Recurse -Filter "*.launch" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                if ($seen.ContainsKey($_.FullName)) {
+                    return
+                }
+
+                $seen[$_.FullName] = $true
+                $launch = Read-VitisLaunchConfig -File $_
+                if ($launch -and (Test-LaunchMatchesProject -Launch $launch -AppName $AppName -PlatformName $PlatformName -AppRoot $AppRoot -PlatformRoot $PlatformRoot)) {
+                    $configs += $launch
+                }
+            }
+    }
+
+    return @($configs | Sort-Object Path)
+}
+
+function Select-VitisLaunchConfig {
+    param(
+        [object[]]$LaunchConfigs,
+        [string]$LaunchConfigName
+    )
+
+    if (-not $LaunchConfigs -or $LaunchConfigs.Count -eq 0) {
+        return $null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($LaunchConfigName)) {
+        $matches = @($LaunchConfigs | Where-Object {
+            ($_.Name -ieq $LaunchConfigName) -or
+            ((Split-Path -Leaf $_.Path) -ieq $LaunchConfigName) -or
+            ($_.Path -ieq $LaunchConfigName)
+        })
+
+        if ($matches.Count -eq 0) {
+            $available = ($LaunchConfigs | ForEach-Object { $_.Name }) -join ", "
+            throw "Launch config not found: $LaunchConfigName. Available local Vitis launch configs: $available"
+        }
+
+        return $matches[0]
+    }
+
+    return @($LaunchConfigs | Sort-Object `
+        @{ Expression = { if ($_.ProcessorFilter) { 0 } else { 1 } } }, `
+        @{ Expression = {
+            switch ($_.Kind) {
+                "debug" { 0; break }
+                "run/debug" { 1; break }
+                "run" { 2; break }
+                default { 3; break }
+            }
+        } },
+        Name)[0]
+}
+
 $workspace = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
 $vitisWs = Resolve-ProjectPath -Base $workspace -Path $VitisWorkspace
 $appRoot = Join-Path $vitisWs $AppName
@@ -117,6 +401,19 @@ if ($VivadoProject -eq "") {
     $VivadoProject = Join-Path $workspace $VivadoProject
 }
 
+$launchConfigs = @(Get-VitisLaunchConfigs -Workspace $workspace -VitisWs $vitisWs -AppName $AppName -PlatformName $PlatformName -AppRoot $appRoot -PlatformRoot $platformRoot)
+$selectedLaunchConfig = Select-VitisLaunchConfig -LaunchConfigs $launchConfigs -LaunchConfigName $LaunchConfigName
+$processorFilterSource = "parameter"
+if ([string]::IsNullOrWhiteSpace($ProcessorFilter)) {
+    if ($selectedLaunchConfig -and $selectedLaunchConfig.ProcessorFilter) {
+        $ProcessorFilter = $selectedLaunchConfig.ProcessorFilter
+        $processorFilterSource = "launch config: $($selectedLaunchConfig.Name)"
+    } else {
+        $ProcessorFilter = "*A9*#0"
+        $processorFilterSource = "default: Zynq-7000 Cortex-A9 #0"
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $vscodeDir | Out-Null
 
 $workspaceFs = Convert-ToForwardSlash $workspace
@@ -136,6 +433,41 @@ $debugTclRelWin = ".vscode\debug_console_$AppName.tcl"
 
 $downloadTclPath = Join-Path $vscodeDir "download_$AppName.tcl"
 $debugTclPath = Join-Path $vscodeDir "debug_console_$AppName.tcl"
+$launchSummaryPath = Join-Path $vscodeDir "vitis_launch_configs.json"
+
+$launchSummary = [ordered]@{
+    vitisWorkspace = $vitisWs
+    appName = $AppName
+    platformName = $PlatformName
+    requestedLaunchConfigName = $LaunchConfigName
+    selectedProcessorFilter = $ProcessorFilter
+    processorFilterSource = $processorFilterSource
+    selectedLaunchConfig = if ($selectedLaunchConfig) {
+        [ordered]@{
+            name = $selectedLaunchConfig.Name
+            kind = $selectedLaunchConfig.Kind
+            path = $selectedLaunchConfig.Path
+            type = $selectedLaunchConfig.Type
+            processorHint = $selectedLaunchConfig.ProcessorHint
+            programHint = $selectedLaunchConfig.ProgramHint
+            inferredProcessorFilter = $selectedLaunchConfig.ProcessorFilter
+        }
+    } else {
+        $null
+    }
+    recognizedLaunchConfigs = @($launchConfigs | ForEach-Object {
+        [ordered]@{
+            name = $_.Name
+            kind = $_.Kind
+            path = $_.Path
+            type = $_.Type
+            processorHint = $_.ProcessorHint
+            programHint = $_.ProgramHint
+            inferredProcessorFilter = $_.ProcessorFilter
+        }
+    })
+}
+Write-Utf8NoBom -Path $launchSummaryPath -Content ($launchSummary | ConvertTo-Json -Depth 8)
 
 $downloadTcl = @"
 # Download and run $AppName on the target.
@@ -276,10 +608,18 @@ $extensions = [ordered]@{
 Write-Utf8NoBom -Path (Join-Path $vscodeDir "extensions.json") -Content ($extensions | ConvertTo-Json -Depth 4)
 
 $settings = [ordered]@{
+    "editor.inlineSuggest.enabled" = $true
+    "editor.quickSuggestions" = [ordered]@{
+        other = "on"
+        comments = "off"
+        strings = "off"
+    }
+    "editor.suggestOnTriggerCharacters" = $true
     "clangd.arguments" = @(
-        "--compile-commands-dir=$workspaceFs",
+        "--compile-commands-dir=${workspaceVar}",
         "--query-driver=$gccFs",
-        "--background-index"
+        "--background-index",
+        "--clang-tidy"
     )
     "C_Cpp.intelliSenseEngine" = "disabled"
     "C_Cpp.autocomplete" = "disabled"
@@ -353,6 +693,24 @@ Run tasks with `Ctrl+Shift+P -> Tasks: Run Task`.
 }
 
 $vivadoLine = if ($VivadoProject) { '- Vivado project: `' + $VivadoProject + '`' } else { "- Vivado project: not configured" }
+$launchConfigLines = @(
+    "- Selected XSCT processor filter: ``$ProcessorFilter`` ($processorFilterSource)"
+)
+if ($selectedLaunchConfig) {
+    $launchConfigLines += "- Selected local Vitis launch config: ``$($selectedLaunchConfig.Name)`` [$($selectedLaunchConfig.Kind)]"
+}
+
+if ($launchConfigs.Count -eq 0) {
+    $launchConfigLines += "- Recognized local Vitis Run/Debug configs: none found"
+} else {
+    $launchConfigLines += "- Recognized local Vitis Run/Debug configs:"
+    foreach ($launchConfig in $launchConfigs) {
+        $filter = if ($launchConfig.ProcessorFilter) { $launchConfig.ProcessorFilter } else { "not inferred" }
+        $launchConfigLines += "  - ``$($launchConfig.Name)`` [$($launchConfig.Kind)], processor filter ``$filter``, file ``$($launchConfig.Path)``"
+    }
+}
+$launchConfigSummary = $launchConfigLines -join "`r`n"
+
 $readme = $readmeTemplate
 $readme = $readme.Replace("@@WORKSPACE@@", $workspace)
 $readme = $readme.Replace("@@VITIS_WS@@", $vitisWs)
@@ -362,6 +720,7 @@ $readme = $readme.Replace("@@VITIS_ROOT@@", $VitisRoot)
 $readme = $readme.Replace("@@ELF@@", $elfFs)
 $readme = $readme.Replace("@@XSA@@", $xsa)
 $readme = $readme.Replace("@@VIVADO_LINE@@", $vivadoLine)
+$readme = $readme.Replace("@@LAUNCH_CONFIGS@@", $launchConfigSummary)
 
 Write-Utf8NoBom -Path $readmePath -Content $readme
 
@@ -372,5 +731,7 @@ Write-Host "Generated VS Code Vitis Classic environment:"
 Write-Host "  $vscodeDir"
 Write-Host "  $(Join-Path $workspace 'compile_commands.json')"
 Write-Host "  $(Join-Path $workspace '.clangd')"
+Write-Host "  $launchSummaryPath"
 Write-Host "  $readmePath"
+Write-Host "Selected XSCT processor filter: $ProcessorFilter ($processorFilterSource)"
 Write-Host "Do not run XSCT download/debug tasks unless target reset is acceptable."

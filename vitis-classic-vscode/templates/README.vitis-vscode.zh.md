@@ -13,6 +13,12 @@
 - XSA: `@@XSA@@`
 @@VIVADO_LINE@@
 
+## 本地 Vitis Run/Debug 配置
+
+@@LAUNCH_CONFIGS@@
+
+脚本会把识别结果写入 `.vscode/vitis_launch_configs.json`。如果本地 Vitis 中有多个 Run/Debug 配置，重新运行脚本时可用 `-LaunchConfigName` 指定配置名；如果处理器目标识别不正确，可用 `-ProcessorFilter` 显式指定 XSCT 目标过滤器。
+
 ## VS Code Tasks
 
 使用 `Ctrl+Shift+P -> Tasks: Run Task` 执行任务。
@@ -23,6 +29,10 @@
 - `Vitis: Download @@APP@@ (XSCT)`: 先构建，再通过 XSCT 复位 PS、执行 `ps7_init`、下载 ELF，然后 `con` 运行。
 - `Vitis: Debug Console @@APP@@ (XSCT)`: 先构建，再通过 XSCT 初始化并下载 ELF，最后停留在 XSCT 交互控制台。
 - `Vivado: Open ...`: 如果找到 `.xpr`，打开 Vivado 工程，方便处理 PL 内容和 bitstream。
+
+## VS Code 设置
+
+脚本会启用 inline suggest、触发字符补全和非注释/非字符串区域的 quick suggestions；clangd 会使用 `${workspaceFolder}` 下的 `compile_commands.json`、Xilinx GCC `--query-driver`、后台索引和 `--clang-tidy`。Microsoft C/C++ 扩展的 IntelliSense 会关闭，由 clangd 负责索引和诊断。
 
 ## 推荐使用顺序
 

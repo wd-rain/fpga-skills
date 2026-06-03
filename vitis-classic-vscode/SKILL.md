@@ -80,6 +80,24 @@ The script creates or updates:
 It avoids PL bitstream download. Vivado bitstream programming remains a Vivado
 Hardware Manager task unless the user explicitly asks to automate it.
 
+## VS Code Settings To Generate
+
+Generate `.vscode\settings.json` with these editor and language-server settings:
+
+- enable `"editor.inlineSuggest.enabled": true`
+- set `"editor.quickSuggestions"` to `other: "on"`, `comments: "off"`, and
+  `strings: "off"`
+- enable `"editor.suggestOnTriggerCharacters": true`
+- set `"C_Cpp.intelliSenseEngine": "disabled"` and keep the existing C/C++
+  extension fallbacks disabled when clangd is the source of truth
+- set `"clangd.arguments"` to include
+  `--compile-commands-dir=${workspaceFolder}`, `--background-index`, and
+  `--clang-tidy`
+
+Keep the generated Xilinx GCC `--query-driver=<arm-none-eabi-gcc.exe>` argument
+in addition to the user-facing clangd arguments above, because clangd needs it
+to trust the Vitis compiler driver and resolve system/BSP headers correctly.
+
 ## Local Vitis Run/Debug Config Discovery
 
 Vitis Classic stores local Run/Debug configurations as Eclipse `.launch` XML
